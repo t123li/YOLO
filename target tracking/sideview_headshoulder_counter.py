@@ -1,4 +1,5 @@
 import os
+import sys
 import cv2
 import numpy as np
 import torch
@@ -16,12 +17,25 @@ from torchvision import transforms
 # MODEL_PATH = "/mnt/disk1/wsk/ultralytics/runs/detect/xd_xfh_260616/train/v8s/weights/best.pt"
 
 # 本地路径（改动1：换成你电脑上的帧目录、输出目录、模型）
-IMAGE_DIR = r"F:/车辆超员检测项目数据集/超员原图0729/20260714151020365"   # 输入：连续帧目录（8帧）
-OUTPUT_DIR = r"F:/vehicle_dataset/sideview_output"                          # 输出：追踪结果图
+# 支持命令行传入输入目录，自动绑定输出目录：
+# python sideview_run_20260715175447965.py <输入目录> [输出目录]
+DEFAULT_IMAGE_DIR = r"F:/车辆超员检测项目数据集/超员原图0729/20260715175447965"
+DEFAULT_OUTPUT_DIR = r"F:/vehicle_dataset"
+if len(sys.argv) >= 2 and sys.argv[1].strip():
+    IMAGE_DIR = os.path.normpath(sys.argv[1])
+    folder_name = os.path.basename(IMAGE_DIR)
+    OUTPUT_DIR = os.path.join(r"F:/vehicle_dataset", f"sideview_output_{folder_name}")
+    if len(sys.argv) >= 3 and sys.argv[2].strip():
+        OUTPUT_DIR = os.path.normpath(sys.argv[2])
+else:
+    IMAGE_DIR = DEFAULT_IMAGE_DIR
+    OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 MODEL_PATH = r"F:/vehicle_dataset/runs/head_v2/weights/best.pt"             # 检测模型：head_v2 训练好的 best.pt
 
-CONF_THRES = 0.25   # 检测置信度阈值：低于此值的 head 框不参与追踪
+CONF_THRES = 0.6    # 检测置信度阈值：低于此值的 head 框不参与追踪（0.25 太松，会混入头枕/反光误检）
 MAX_AGE = 8         # 轨迹最大存活帧数：连续 8 帧没被匹配到就判定"该人消失"
+SPATIAL_R = 70      # 空间兜底半径：外观匹配失败时，位置在半径内的存活轨迹沿用其 ID
+DIST_GATE = 80      # 阶段一位置门限：整车平移已由 RANSAC 补偿，剩余位移应很小（RANSAC 失效时回退用 150）
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -80,20 +94,41 @@ class HeadShoulderTrack:
         self.feat_history.append(feat)
         self.age = 0
         self.velocity = np.array([0.0, 0.0])  # 该目标的独立运动向量 [dx, dy]
-
-    def get_avg_feat(self):
-        avg_f = np.mean(np.array(self.feat_history), axis=0)
-        return avg_f / (np.linalg.norm(avg_f) + 1e-6)
+        self.missed_shift = np.array([0.0, 0.0])  # 漏检期间累计的整车平移，用于修正预测位置
 
 
 class MotionCoherentTracker:
     def __init__(self):
         self.tracks = []
         self.next_global_id = 0
-        self.global_id_history = {}  # { global_id: [feats] }
+        self.global_id_history = {}  # { global_id: deque([feat,...], maxlen=5) }
         self.global_vehicle_velocity = np.array([0.0, 0.0])  # 全局车速
+        self.global_shift = np.array([0.0, 0.0])  # RANSAC 估计的整车帧间平移（GMC 简化版）
+        self.shift_inliers = 0
 
-    def update(self, dets, feats):
+    def _estimate_global_shift(self, dets, tol=30.0):
+        """RANSAC 估计整车帧间平移：寻找使最多 (旧轨迹中心, 新检测中心) 点对对齐的位移。
+
+        对应论文 GMC（稀疏光流 + RANSAC 仿射变换）的思想，但直接用检测点代替光流关键点。
+        """
+        track_c = [np.array(get_center(t.bbox)) for t in self.tracks]
+        det_c = [np.array(get_center(d)) for d in dets]
+        if not track_c or not det_c:
+            return np.array([0.0, 0.0]), 0
+        best_shift, best_n = np.array([0.0, 0.0]), 0
+        for tc in track_c:
+            for dc in det_c:
+                s = dc - tc
+                n = 0
+                for tc2 in track_c:
+                    for dc2 in det_c:
+                        if np.linalg.norm(dc2 - tc2 - s) < tol:
+                            n += 1
+                if n > best_n:
+                    best_n, best_shift = n, s
+        return best_shift, best_n
+
+    def update(self, dets, feats, confs):
         for t in self.tracks:
             t.age += 1
 
@@ -103,32 +138,51 @@ class MotionCoherentTracker:
         if len(dets) == 0:
             return ["Detecting..."] * len(dets)
 
-        # 协同运
+        # ---- GMC 简化版（论文"稀疏光流+RANSAC"的检测点版）----
+        # 用 RANSAC 从 (旧轨迹, 新检测) 点对里估计整车帧间平移，
+        # 解决车速 EMA 在车辆加速/减速时预测滞后导致的跨帧错配（ID 切换主因）。
+        self.global_shift, self.shift_inliers = self._estimate_global_shift(dets)
+        use_shift = self.shift_inliers >= 2
+
         predicted_centers = {}
         for j, t in enumerate(self.tracks):
             cx, cy = get_center(t.bbox)
-            v = t.velocity if np.linalg.norm(t.velocity) > 0 else self.global_vehicle_velocity
-            predicted_centers[j] = np.array([cx, cy]) + v
+            if use_shift:
+                # bbox 是上次匹配时的位置；若中途漏检，需加上漏检期间累计的整车平移
+                predicted_centers[j] = np.array([cx, cy]) + self.global_shift + t.missed_shift
+            else:
+                v = t.velocity if np.linalg.norm(t.velocity) > 0 else self.global_vehicle_velocity
+                predicted_centers[j] = np.array([cx, cy]) + v * t.age
+
+        dist_gate = DIST_GATE if use_shift else 150.0
 
         # 阶段一：运动补偿位置 + 外观 双指标配对
+        # 论文改进3：代价矩阵自适应加权（式4-19/4-20），w_m 由检测置信度经 S 型函数决定。
+        # 注意：论文原式在高置信时 w_m→1（纯运动匹配），适用于 MOT17 大目标场景；
+        # 本场景人头框小(40-80px)、位置噪声 15-20px、邻座间距仅 ~35px，运动区分不了
+        # 邻座，因此把 S 型曲线映射到 [0.2, 0.5]，外观始终占主导、置信度只做微调。
         matches = []
         for i, det in enumerate(dets):
             d_cx, d_cy = get_center(det)
+            c = confs[i]
+            s_c = (c * c) / (c * c + (1.0 - c) * (1.0 - c))
+            w_m = 0.2 + 0.3 * s_c
             for j, t in enumerate(self.tracks):
                 if j in matched_tracks:
                     continue
                 dist = np.linalg.norm(np.array([d_cx, d_cy]) - predicted_centers[j])
-                sim = np.dot(feats[i], t.get_avg_feat())
-                # 距离 <150px 且 相似度 >0.68 才认为是同一个人
-                if dist < 150 and sim > 0.68:
-                    score = sim * 0.7 + (1.0 - dist / 150.0) * 0.3
-                    matches.append((score, i, j, dist))
+                sims = np.dot(np.array(t.feat_history), feats[i])
+                sim = float(np.max(sims))
+                if dist < dist_gate and sim > 0.68:
+                    motion_score = 1.0 - dist / dist_gate
+                    score = w_m * motion_score + (1.0 - w_m) * sim
+                    matches.append((score, i, j, dist, sim))
 
         matches.sort(key=lambda x: x[0], reverse=True)
 
         velocity_samples = []
 
-        for score, i, j, dist in matches:
+        for score, i, j, dist, sim in matches:
             if assigned_indices[i] == -1 and j not in matched_tracks:
                 assigned_indices[i] = j
                 matched_tracks.add(j)
@@ -138,21 +192,26 @@ class MotionCoherentTracker:
                 new_cx, new_cy = get_center(dets[i])
                 inst_velocity = np.array([new_cx - old_cx, new_cy - old_cy])
 
-                t.velocity = t.velocity * 0.5 + inst_velocity * 0.5
+                # 论文改进2(NSA, 式4-18)思想：高置信→更信任新观测，低置信→保守更新
+                w = float(np.clip(confs[i], 0.2, 0.9))
+                t.velocity = t.velocity * (1.0 - w) + inst_velocity * w
                 velocity_samples.append(t.velocity)
 
                 t.bbox = dets[i]
                 t.feat_history.append(feats[i])
                 t.age = 0
+                t.missed_shift = np.array([0.0, 0.0])
 
         # 更新全局车速
         if len(velocity_samples) > 0:
             self.global_vehicle_velocity = np.mean(velocity_samples, axis=0)
 
         # 阶段二：新出现 / 刚恢复的人，全局回溯认领
-        # 修复同帧重复ID：本帧新建的 ID 先记录到临时字典，帧尾再写入历史库，
-        # 否则本帧后面另一个框回溯时会匹配到这个"刚建的新 ID"，导致两个框拿到同一个 ID。
-        new_history_entries = {}
+        # 修复1：claimed_gids 保证"一个 gid 本帧只认领一次"，避免同帧重复 ID；
+        #        同时把阶段一已匹配到的 gid 也加入，防止阶段二重复认领。
+        claimed_gids = {self.tracks[j].global_id for j in matched_tracks}
+        pre_track_indices = list(range(len(self.tracks)))  # 阶段二开始时已有的轨迹快照
+
         for i in range(len(dets)):
             if assigned_indices[i] != -1:
                 continue
@@ -161,29 +220,74 @@ class MotionCoherentTracker:
             matched_gid = -1
             best_sim = 0
 
+            # 历史库：每个 gid 存最近若干帧特征(deque)，用 max 匹配（比 EMA 单向量更稳）
+            # 论文改进2(NSA)思想：低置信度检测"权威性"低，需更高相似度才能认领旧 ID
+            claim_thr = 0.76 + (1.0 - confs[i]) * 0.10
             for gid, feat_list in self.global_id_history.items():
+                if gid in claimed_gids:
+                    continue
                 sims = np.dot(np.array(feat_list), det_feat)
-                max_s = np.max(sims)
+                max_s = float(np.max(sims))
                 if max_s > best_sim:
                     best_sim = max_s
-                    if max_s > 0.76:  # 全局合并门槛
+                    if max_s > claim_thr:  # 全局合并门槛（置信度自适应）
                         matched_gid = gid
+
+            # 空间兜底：外观匹配失败时，若某条"未被匹配的存活轨迹"预测位置离这个
+            # 检测框很近，说明是同一个人只是外观暂时变差，直接沿用其 gid。
+            spatial_j = -1
+            if matched_gid == -1:
+                d_cx, d_cy = get_center(dets[i])
+                best_d = SPATIAL_R * (0.5 + 0.5 * confs[i])   # 低置信→更小兜底半径
+                for j in pre_track_indices:
+                    if j in matched_tracks:
+                        continue
+                    if self.tracks[j].global_id in claimed_gids:
+                        continue
+                    dist = np.linalg.norm(np.array([d_cx, d_cy]) - predicted_centers[j])
+                    if dist < best_d:
+                        best_d = dist
+                        spatial_j = j
+                if spatial_j != -1:
+                    matched_gid = self.tracks[spatial_j].global_id
+                    matched_tracks.add(spatial_j)
+                    best_sim = 0.0
 
             if matched_gid == -1:
                 matched_gid = self.next_global_id
                 self.next_global_id += 1
-                new_history_entries[matched_gid] = [det_feat]   # 原：直接写 self.global_id_history
+                self.global_id_history[matched_gid] = deque([det_feat], maxlen=5)
             else:
-                if len(self.global_id_history[matched_gid]) < 5 and best_sim > 0.82:
-                    self.global_id_history[matched_gid].append(det_feat)
+                self.global_id_history[matched_gid].append(det_feat)  # 滚动更新
+            claimed_gids.add(matched_gid)
 
-            new_track = HeadShoulderTrack(matched_gid, dets[i], det_feat)
-            self.tracks.append(new_track)
-            assigned_indices[i] = len(self.tracks) - 1
+            tag = " (spatial)" if spatial_j != -1 else ""
+            print(f"    stage2: det#{i} best_sim={best_sim:.3f} -> gid {matched_gid}{tag}")
 
-        # 帧尾：把本帧新建的 ID 正式写入历史库
-        for gid, feat in new_history_entries.items():
-            self.global_id_history[gid] = feat
+            # 修复2：若该 gid 已有存活 track，直接复用更新它，而不是再建一条
+            existing_idx = None
+            for idx, t in enumerate(self.tracks):
+                if t.global_id == matched_gid:
+                    existing_idx = idx
+                    break
+
+            if existing_idx is not None:
+                t = self.tracks[existing_idx]
+                t.bbox = dets[i]
+                t.feat_history.append(det_feat)
+                t.age = 0
+                t.missed_shift = np.array([0.0, 0.0])
+                assigned_indices[i] = existing_idx
+            else:
+                new_track = HeadShoulderTrack(matched_gid, dets[i], det_feat)
+                self.tracks.append(new_track)
+                assigned_indices[i] = len(self.tracks) - 1
+
+        # 本帧未被匹配的旧轨迹：累计整车平移，供下次预测修正位置
+        acc_shift = self.global_shift if use_shift else self.global_vehicle_velocity
+        for j in pre_track_indices:
+            if j not in matched_tracks:
+                self.tracks[j].missed_shift += acc_shift
 
         # 生成本帧标签
         frame_labels = []
@@ -259,7 +363,7 @@ for i, name in enumerate(images):
         continue
 
     result = yolo.predict(img, conf=CONF_THRES, verbose=False)[0]
-    dets, feats = [], []
+    dets, feats, confs = [], [], []
 
     for box in result.boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
@@ -270,13 +374,20 @@ for i, name in enumerate(images):
         feat = extract_feat(crop)
         dets.append((x1, y1, x2, y2))
         feats.append(feat)
+        confs.append(float(box.conf[0].cpu().numpy()))
 
-    display_labels = tracker.update(dets, feats)
+    display_labels = tracker.update(dets, feats, confs)
+
+    ids_in_frame = [lbl.split(":")[-1] for lbl in display_labels]
+    det_str = ", ".join(f"({d[0]},{d[1]})c={c:.2f}" for d, c in zip(dets, confs))
+    print(f"[{i}/{len(images)}] {name} -> IDs = {ids_in_frame}")
+    print(f"      dets: {det_str}")
+    print(f"      ransac shift=({tracker.global_shift[0]:.0f},{tracker.global_shift[1]:.0f}) inliers={tracker.shift_inliers}")
 
     # 智能标签放置（改动3：标签默认放框上方，重叠时自动换到其他方向）
     draw_boxes_with_labels(img, dets, display_labels)
 
-    v_str = f"Estimated Vehicle Speed: dx={tracker.global_vehicle_velocity[0]:.1f}, dy={tracker.global_vehicle_velocity[1]:.1f}"
+    v_str = f"RANSAC Shift: dx={tracker.global_shift[0]:.1f}, dy={tracker.global_shift[1]:.1f} (inliers={tracker.shift_inliers})"
     cv2.putText(img, v_str, (20, img.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
 
     cv2.putText(img, f"Total Registered Passengers: {tracker.total_count()}", (20, 50),
