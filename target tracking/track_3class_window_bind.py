@@ -45,7 +45,7 @@ OUT_ROOT = os.path.join(BASE_DIR, "tracking_output")
 CLASS_NAMES = {0: 'car', 1: 'head', 2: 'window'}
 
 # ================= 检测配置 =================
-CONF_HEAD = 0.3     # head 阈值（3类模型 head_shoulder，可调：太高漏检→欠计数，太低混入头枕/反光→ID碎片）
+CONF_HEAD = 0.15    # head 阈值（3类模型 head_shoulder；降低以召回遮挡/小目标，误检交给确认机制）
 CONF_WIN = 0.20     # window 阈值
 CONF_CAR = 0.30     # car 阈值
 PRED_CONF = 0.2     # 预测底层 conf（之后按类过滤）
@@ -65,8 +65,8 @@ MAX_AGE = 8          # 轨迹最大丢失帧数
 SPATIAL_R = 90       # 空间兜底半径（高速帧间位移大，适当放宽）
 DIST_GATE = 120      # 阶段一位置门限（侧视高速下帧间位移可达 100px+，80 太紧导致 ID 碎片）
 SIM_GATE = 0.55      # 阶段一外观相似度门限（3类模型 head 框小、夜间 OSNet 特征弱，0.68 太苛刻）
-# 车窗跨帧跟踪：IoU 匹配（窗为刚体，随车平移，用中位数位移补偿后 IoU 稳定）
-WIN_IOU_THRESH = 0.25     # 位移补偿后同窗 IoU 应 >0.8，0.25 门限对帧间位移大也够稳
+# 车窗跨帧跟踪：用"窗在车身的位置(relx)"贪心匹配（相邻窗 relx 差约 0.1-0.3，0.2 不会错配）
+WIN_ASSOC_RELX = 0.20     # relx 匹配门限（窗相对车框归一化 x 的距离）
 WIN_TRACK_MAX_AGE = 5     # 车窗轨迹最大丢失帧数
 
 # ================= 工具 =================
@@ -131,31 +131,50 @@ def imread_cn(path):
 # ================= 第 1 层：车窗跨帧跟踪 =================
 
 class WindowTrack:
-    __slots__ = ('wid', 'box', 'age', 'hits')
-    def __init__(self, wid, box):
+    __slots__ = ('wid', 'box', 'relx', 'velocity', 'age', 'hits')
+    def __init__(self, wid, box, relx):
         self.wid = wid
         self.box = box
+        self.relx = relx          # 窗在车身的位置：中心相对车框的归一化 x
+        self.velocity = np.array([0.0, 0.0])   # 每窗自身的帧间速度（匀速运动模型）
         self.age = 0
         self.hits = 1
 
 
 class WindowTracker:
-    """车窗跨帧跟踪：IoU + 中位数位移补偿，给车窗分配稳定 ID。
+    """车窗跨帧跟踪：用"窗离车头的物理位置"跨帧匹配，给车窗分配稳定 ID。
 
-    车窗是刚体、只随车辆整体平移。帧间先用所有"旧窗→本帧窗"点对的中位数位移
-    补偿旧窗位置，再算 IoU 匹配（贪心，阈值 0.25）。这比"车锚定 relx"稳定得多：
-    relx 依赖车框检测（快速移动时噪声大 → relx 漂移 → 窗 ID 重建），
-    而窗自身的检测位移中位数直接反映车辆平移，不受车框框定位误差影响。
-    窗漏检时轨迹保留 WIN_TRACK_MAX_AGE 帧。
+    车窗是刚体、相对车身位置固定。关键先验：车的运动方向（车头朝向）决定车窗的
+    左右顺序——车头朝右(+1) 时从左到右是 后窗→中窗→前窗；车头朝左(-1) 时反之。
+    因此用"离车头的归一化距离"作为窗的物理身份（0=最靠车头，越大越靠车尾），
+    跨帧稳定：即使中间插入新窗（如中窗后露），前窗/后窗的槽位不变。
+    匹配策略：
+    1. 顺序优先：旧窗按 slot 排序、新窗按 slot 排序，"第 k 旧窗 ↔ 第 k 新窗"，
+       slot 差 < 门限才接受（同一物理窗 slot 稳定）。
+    2. slot 最近邻兜底：未配的新窗找 slot 最近的未用旧窗。
     """
-    def __init__(self, iou_thresh=WIN_IOU_THRESH, max_age=WIN_TRACK_MAX_AGE):
-        self.iou_thresh = iou_thresh
+    def __init__(self, relx_dist=WIN_ASSOC_RELX, max_age=WIN_TRACK_MAX_AGE):
+        self.relx_dist = relx_dist
         self.max_age = max_age
         self.tracks = {}       # wid -> WindowTrack
         self.next_wid = 0
 
-    def update(self, win_boxes):
-        """win_boxes: 本帧候选窗框(已 NMS + 几何过滤 + 在车内)。返回 [(wid, box)] 按 x 排序。"""
+    @staticmethod
+    def _relx(b, car_box, direction, img_w):
+        """窗离车头的归一化距离：0=最靠车头(前窗)，越大越靠车尾。方向无关。"""
+        wcx = (b[0] + b[2]) / 2.0
+        if car_box is not None and (car_box[2] - car_box[0]) > 0:
+            cw = car_box[2] - car_box[0]
+            if direction > 0:   # 车头在右，前窗在最右
+                return (car_box[2] - wcx) / cw
+            else:              # 车头在左，前窗在最左
+                return (wcx - car_box[0]) / cw
+        # 无车框：按画面水平位置兜底（车头在右假设）
+        return (img_w - wcx) / img_w if img_w > 0 else 0.5
+
+    def update(self, win_boxes, car_box, direction, img_w):
+        """win_boxes: 本帧候选窗框(已 NMS + 几何过滤 + 在车内)。
+        car_box/direction/img_w: 用于算"离车头的物理位置"。返回 [(wid, box)] 按 x 排序。"""
         if not win_boxes:
             for wid in [wid for wid, t in self.tracks.items() if (t.age + 1) > self.max_age]:
                 del self.tracks[wid]
@@ -163,49 +182,68 @@ class WindowTracker:
                 t.age += 1
             return []
 
+        # 本帧候选窗：按 slot(离车头距离) 排序用于匹配，输出时再按 x 排序
         boxes = sorted(win_boxes, key=lambda b: (b[0]+b[2])/2.0)   # 仅定显示顺序
+        new_relx = [self._relx(b, car_box, direction, img_w) for b in boxes]
+        # 按 slot 升序重排（0=前窗最靠车头），匹配用
+        ordered = sorted(zip(boxes, new_relx), key=lambda x: x[1])
+        boxes_match = [b for b, _ in ordered]
+        new_relx_match = [rx for _, rx in ordered]
 
         if not self.tracks:
             result = []
-            for b in boxes:
+            for b, rx in zip(boxes, new_relx):
                 wid = self.next_wid; self.next_wid += 1
-                self.tracks[wid] = WindowTrack(wid, b)
+                self.tracks[wid] = WindowTrack(wid, b, rx)
                 result.append((wid, b))
             return result
 
-        # 中位数位移补偿：所有 (旧窗中心, 本帧窗中心) 点对的位移中位数
-        old_c = [np.array(box_center(t.box)) for t in self.tracks.values()]
-        new_c = [np.array(box_center(b)) for b in boxes]
-        shifts = [dc - oc for oc in old_c for dc in new_c]
-        shifts_arr = np.array(shifts)
-        if len(shifts_arr):
-            shift = np.median(shifts_arr, axis=0)
-        else:
-            shift = np.zeros(2)
+        # 旧窗按 slot 排序（离车头距离：0=前窗）
+        old_sorted = sorted(self.tracks.values(), key=lambda t: t.relx)
 
-        used = set()
-        matched = {}
-        for i, b in enumerate(boxes):
-            best = None; best_iou = self.iou_thresh
-            for wid, t in self.tracks.items():
-                if wid in used: continue
-                pred = [t.box[0]+shift[0], t.box[1]+shift[1], t.box[2]+shift[0], t.box[3]+shift[1]]
-                iou = compute_iou(b, pred)
-                if iou > best_iou:
-                    best_iou = iou; best = wid
+        used_new = set()
+        used_old = set()
+        matched = {}   # match_index -> wid
+
+        # 1. 顺序优先：第 k 旧窗 ↔ 第 k 新窗（都按 slot 升序），slot 差 < 门限才接受
+        for k in range(min(len(old_sorted), len(boxes_match))):
+            t = old_sorted[k]
+            d = abs(new_relx_match[k] - t.relx)
+            if d < self.relx_dist:
+                matched[k] = t.wid
+                used_new.add(k)
+                used_old.add(t.wid)
+
+        # 2. slot 最近邻兜底：未配的新窗，找未用旧窗中 slot 最近的
+        for i in range(len(boxes_match)):
+            if i in used_new:
+                continue
+            best = None; best_d = self.relx_dist
+            for t in old_sorted:
+                if t.wid in used_old:
+                    continue
+                d = abs(new_relx_match[i] - t.relx)
+                if d < best_d:
+                    best_d = d; best = t.wid
             if best is not None:
-                used.add(best); matched[i] = best
+                matched[i] = best
+                used_new.add(i)
+                used_old.add(best)
 
         new_tracks = {}
         result = []
-        for i, b in enumerate(boxes):
+        for i, b in enumerate(boxes_match):
             if i in matched:
                 wid = matched[i]
                 t = self.tracks[wid]
+                inst_v = np.array([box_center(b)[0] - box_center(t.box)[0],
+                                   box_center(b)[1] - box_center(t.box)[1]])
+                t.velocity = 0.6 * t.velocity + 0.4 * inst_v
+                t.relx = new_relx_match[i]
                 t.box = b; t.age = 0; t.hits += 1
             else:
                 wid = self.next_wid; self.next_wid += 1
-                t = WindowTrack(wid, b)
+                t = WindowTrack(wid, b, new_relx_match[i])
             new_tracks[wid] = t
             result.append((wid, b))
         for wid, t in self.tracks.items():
@@ -227,6 +265,7 @@ class HeadShoulderTrack:
         self.feat_history = deque(maxlen=5)
         self.feat_history.append(feat)
         self.age = 0
+        self.hits = 1                      # 该轨迹被观测到的帧数（确认机制用）
         self.velocity = np.array([0.0, 0.0])       # 该目标独立运动向量 [dx, dy]
         self.missed_shift = np.array([0.0, 0.0])   # 漏检期间累计整车平移，用于修正预测位置
         self.bound_window = win                    # 绑定车窗 ID（None=尚未在窗内见过）
@@ -246,6 +285,7 @@ class MotionCoherentTracker:
         self.tracks = []
         self.next_global_id = 0
         self.global_id_history = {}   # { gid: deque([feat,...], maxlen=5) }
+        self.gid_hits = {}            # { gid: 累计观测帧数 }，确认机制用
         self.gid_window = {}          # { gid: 绑定窗ID 或 None }
         self.global_vehicle_velocity = np.array([0.0, 0.0])
         self.global_shift = np.array([0.0, 0.0])     # RANSAC 估计的整车帧间平移
@@ -374,6 +414,8 @@ class MotionCoherentTracker:
                 t.bbox = dets[i]
                 t.feat_history.append(feats[i])
                 t.age = 0
+                t.hits += 1
+                self.gid_hits[t.global_id] = self.gid_hits.get(t.global_id, 0) + 1
                 t.missed_shift = np.array([0.0, 0.0])
                 if wins[i] is not None:
                     t.bound_window = wins[i]
@@ -432,15 +474,43 @@ class MotionCoherentTracker:
                     matched_tracks.add(spatial_j)
                     best_sim = 0.0
 
+            # 窗内位置占用抑制：仍未匹配上时，若检测落在某活跃轨迹的窗内且窗内 rel 距离很近
+            # （< 0.35 窗宽），沿用该 ID 而非新建。对抗"多人挤窗 + 低分框重复框选 → OSNet 判新人"。
+            if matched_gid == -1 and wins[i] is not None:
+                wb = win_boxes.get(wins[i])
+                if wb is not None and rels[i] is not None:
+                    ww = wb[2] - wb[0]
+                    if ww > 0:
+                        best_occ = None; best_occ_d = 0.35 * ww
+                        for j in pre_track_indices:
+                            if j in matched_tracks:
+                                continue
+                            t = self.tracks[j]
+                            if t.bound_window != wins[i]:
+                                continue
+                            if t.rel_pos is None:
+                                continue
+                            # 窗内 rel 距离 × 窗宽 = 像素距离
+                            d = np.hypot((rels[i][0]-t.rel_pos[0])*ww,
+                                         (rels[i][1]-t.rel_pos[1])*(wb[3]-wb[1]))
+                            if d < best_occ_d:
+                                best_occ_d = d; best_occ = j
+                        if best_occ is not None:
+                            matched_gid = self.tracks[best_occ].global_id
+                            matched_tracks.add(best_occ)
+                            best_sim = 0.0
+
             if matched_gid == -1:
                 matched_gid = self.next_global_id
                 self.next_global_id += 1
                 self.global_id_history[matched_gid] = deque([det_feat], maxlen=5)
+                self.gid_hits[matched_gid] = 1
                 self.gid_window[matched_gid] = wins[i]   # 首次出现即绑定车窗
                 if wins[i] is not None:
                     pass  # bound_window 在新建 track 时设置
             else:
                 self.global_id_history[matched_gid].append(det_feat)
+                self.gid_hits[matched_gid] = self.gid_hits.get(matched_gid, 0) + 1
             claimed_gids.add(matched_gid)
 
             existing_idx = None
@@ -454,6 +524,7 @@ class MotionCoherentTracker:
                 t.bbox = dets[i]
                 t.feat_history.append(det_feat)
                 t.age = 0
+                t.hits += 1
                 t.missed_shift = np.array([0.0, 0.0])
                 if wins[i] is not None:
                     t.bound_window = wins[i]
@@ -485,8 +556,14 @@ class MotionCoherentTracker:
         self.tracks = [t for t in self.tracks if t.age <= MAX_AGE]
         return frame_gids, frame_wins
 
+    def confirmed_ids(self, min_hits=2):
+        """确认过的 ID 集合：累计观测 >= min_hits 帧的 ID（单帧碎片不确认）。"""
+        return {gid for gid, h in self.gid_hits.items() if h >= min_hits}
+
     def total_count(self):
-        return len(self.global_id_history)
+        """累计唯一人数：所有出现过的唯一 ID 数（渲染有框就立即计数，不滞后）。
+        过计数由跟踪器的 ID 关联质量治理，而非"晚统计"。"""
+        return len(self.gid_hits)
 
 
 # ================= 渲染 =================
@@ -552,11 +629,45 @@ def render_frame(img, car_box, windows, head_dets, actual_count, pred_count):
 # ================= 简单车跟踪 =================
 
 class SimpleCarTracker:
-    """极简车跟踪：选面积最大的 car 框。"""
-    def update(self, boxes):
-        if not boxes: return None
+    """极简车跟踪：选面积最大的 car 框，并判断车的运动方向（车头朝向）。
+
+    方向推断分两阶段：
+    1. 首帧启发式：车从画面一侧进入，贴边一侧是车尾。car_left≈0 → 车头朝右(+1)；
+       car_right≈画面右缘 → 车头朝左(-1)；居中 → 默认 +1。
+    2. 位移确认：用 car 框中心 x 的累计位移方向锁定，锁后不再改变。
+    首帧即给出 direction，避免"前几帧不框窗"；位移确认后若与首帧启发式冲突，
+    由调用方用 confirmed 判断是否重置窗跟踪。
+    """
+    def __init__(self, edge_margin=60):
+        self.last_center = None
+        self.direction = 1
+        self.direction_at_first = 1   # 首帧启发式方向（位移确认后用于判断是否冲突）
+        self.acc_shift = 0.0
+        self.confirmed = False
+        self.edge_margin = edge_margin
+
+    def update(self, boxes, img_w=0):
+        if not boxes:
+            return None, self.direction, self.confirmed
         areas = [(b[2]-b[0])*(b[3]-b[1]) for b in boxes]
-        return boxes[max(range(len(areas)), key=lambda i: areas[i])]
+        cb = boxes[max(range(len(areas)), key=lambda i: areas[i])]
+        cx = (cb[0] + cb[2]) / 2
+        if self.last_center is None:
+            # 首帧：用 car 框位置启发式判断车头方向（贴边一侧是车尾）
+            if img_w > 0 and cb[2] > img_w - self.edge_margin and cb[0] > self.edge_margin:
+                self.direction = -1   # 右边缘贴画面右缘 → 车尾在右 → 车头朝左
+            elif cb[0] < self.edge_margin:
+                self.direction = 1    # 左边缘贴画面左缘 → 车尾在左 → 车头朝右
+            else:
+                self.direction = 1    # 居中，默认车头朝右
+            self.direction_at_first = self.direction
+        else:
+            self.acc_shift = 0.8 * self.acc_shift + 0.2 * (cx - self.last_center)
+            if not self.confirmed and abs(self.acc_shift) > 3.0:
+                self.confirmed = True
+                self.direction = 1 if self.acc_shift > 0 else -1
+        self.last_center = cx
+        return cb, self.direction, self.confirmed
 
 
 # ================= 特征提取 =================
@@ -572,6 +683,51 @@ def extract_feat(img_crop, reid_model, transform, device):
 
 def get_center(box):
     return (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+
+
+def dedup_heads_in_window(head_boxes, head_scores, windows, max_rel=0.12):
+    """检测层去重：同窗内窗内 rel 距离极近（< max_rel 窗宽）的多个 head 检测只保留高分。
+
+    只去"几乎同一位置"的真重复框（窗内间距 < 1/8 窗宽，约等于框的左右偏移量），
+    不误删位置不同的真实乘客。过计数主要交给跟踪器的 ID 管理解决。
+    返回 (kept_boxes, kept_scores)。
+    """
+    if not head_boxes:
+        return [], []
+    win_boxes = dict(windows)
+    keep_idx = []
+    kept_center = {}   # idx -> ((rx, ry), wid)
+    for i, hb in enumerate(head_boxes):
+        hc = box_center(hb)
+        wid = next((wid for wid, wb in windows if point_in_box(hc, wb)), None)
+        dup = False
+        for k in keep_idx:
+            if wid is None:
+                continue
+            kc, kwid = kept_center.get(k, (None, None))
+            if kwid != wid or kc is None:
+                continue
+            wb = win_boxes[wid]
+            ww = wb[2] - wb[0]
+            wh = wb[3] - wb[1]
+            if ww <= 0 or wh <= 0:
+                continue
+            rx = (hc[0] - wb[0]) / ww
+            ry = (hc[1] - wb[1]) / wh
+            d = np.hypot((rx - kc[0]) * ww, (ry - kc[1]) * wh)
+            if d < max_rel * ww:
+                dup = True
+                break
+        if not dup:
+            keep_idx.append(i)
+            if wid is not None:
+                wb = win_boxes[wid]
+                ww = wb[2] - wb[0]
+                wh = wb[3] - wb[1]
+                rx = (hc[0] - wb[0]) / ww if ww > 0 else 0.5
+                ry = (hc[1] - wb[1]) / wh if wh > 0 else 0.5
+                kept_center[i] = ((rx, ry), wid)
+    return [head_boxes[i] for i in keep_idx], [head_scores[i] for i in keep_idx]
 
 
 # ================= 主流程 =================
@@ -606,24 +762,30 @@ def process_sequence(model, reid_model, transform, device, seq, out_sub):
             boxes_by_cls[cid]['boxes'].append([x1, y1, x2, y2])
             boxes_by_cls[cid]['scores'].append(score)
 
-        # 车（面积最大；本帧漏检时沿用上一帧，保持窗锚定稳定）
-        car_box = car_tracker.update(boxes_by_cls[0]['boxes'])
+        # 车（面积最大；本帧漏检时沿用上一帧，保持窗锚定稳定）；direction 判断车头朝向
+        car_box, car_dir, car_confirmed = car_tracker.update(boxes_by_cls[0]['boxes'], img_w)
         if car_box is None:
             car_box = last_car_box
         else:
             last_car_box = car_box
 
-        # 车窗：NMS + 几何过滤 + 在车内 → 跨帧跟踪（稳定窗 ID）
+        # 位移确认后若方向与首帧启发式不同，重置窗跟踪（用正确方向重建，避免槽位错配）
+        if car_confirmed and car_dir != car_tracker.direction_at_first:
+            window_tracker = WindowTracker()
+
+        # 车窗：NMS + 几何过滤 + 在车内 → 跨帧跟踪（稳定窗 ID）；首帧即建窗（启发式方向）
         win_boxes = boxes_by_cls[2]['boxes']
         w_nms, w_scores = dedup_boxes(win_boxes, boxes_by_cls[2]['scores'], DEDUP_IOU_THRESH_WIN)
         w_in = [wb for wb in w_nms if car_box is None or point_in_box(box_center(wb), car_box)]
         w_geom = filter_windows_by_geometry(w_in, car_box)
-        windows = window_tracker.update(w_geom)   # [(wid, box)] 按 x 排序，窗 ID 跨帧稳定
+        windows = window_tracker.update(w_geom, car_box, car_dir, img_w)   # [(wid, box)] 按 x 排序，窗 ID 跨帧稳定
         win_boxes = {wid: wb for wid, wb in windows}   # wid -> 窗框，供人 tracker 算窗内 rel
 
         # head：提特征 + 绑定窗（中心点落在哪个窗框内）
         head_boxes = boxes_by_cls[1]['boxes']
         head_scores = boxes_by_cls[1]['scores']
+        # 检测层去重：同窗内 rel 距离极近的多个检测只留高分（对抗环境模糊多框）
+        head_boxes, head_scores = dedup_heads_in_window(head_boxes, head_scores, windows)
         dets, feats, confs, wins = [], [], [], []
         for i, hb in enumerate(head_boxes):
             x1, y1, x2, y2 = [int(v) for v in hb]
@@ -644,7 +806,12 @@ def process_sequence(model, reid_model, transform, device, seq, out_sub):
         pred_count = person_tracker.total_count()
 
         head_dets = [(dets[i], gids[i]) for i in range(len(dets))]
-        win_draw = [(wid, wb, len(window_seen[wid])) for wid, wb in windows]
+        # 每窗人数 = 本帧落在该窗的 head 检测数（当前帧可见人数，不做确认过滤，避免滞后）
+        frame_win_counts = {}
+        for gid, w in zip(gids, frame_wins):
+            if w is not None:
+                frame_win_counts[w] = frame_win_counts.get(w, 0) + 1
+        win_draw = [(wid, wb, frame_win_counts.get(wid, 0)) for wid, wb in windows]
         out_img = render_frame(img, car_box, win_draw, head_dets,
                                actual_count if actual_count is not None else -1, pred_count)
         cv2.imencode('.jpg', out_img)[1].tofile(os.path.join(out_sub, name))
