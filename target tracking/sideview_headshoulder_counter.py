@@ -30,7 +30,7 @@ if len(sys.argv) >= 2 and sys.argv[1].strip():
 else:
     IMAGE_DIR = DEFAULT_IMAGE_DIR
     OUTPUT_DIR = DEFAULT_OUTPUT_DIR
-MODEL_PATH = r"F:/vehicle_dataset/runs/head_v2/weights/best.pt"             # 检测模型：head_v2 训练好的 best.pt
+MODEL_PATH = r"D:/桌面文件/文档素材/东南大学/1.学术相关/车辆超员检测项目/YOLO/target detection/run_head_seqsplit/weights/best.pt"             # 检测模型：run_head_seqsplit 序列级划分重训的 best.pt
 
 CONF_THRES = 0.6    # 检测置信度阈值：低于此值的 head 框不参与追踪（0.25 太松，会混入头枕/反光误检）
 MAX_AGE = 8         # 轨迹最大存活帧数：连续 8 帧没被匹配到就判定"该人消失"
@@ -77,6 +77,27 @@ def extract_feat(img_crop):
 
 def get_center(box):
     return (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+
+
+def read_actual_count(image_dir):
+    """从输入序列目录读取人工核实的总人数（total_registered.txt，格式：total_registered <N>）。
+
+    找不到文件时返回 None（不显示对照）。用于快速判断跟踪计数的准确度。
+    """
+    for cand in ("total_registered.txt", "actual_count.txt"):
+        p = os.path.join(image_dir, cand)
+        if os.path.exists(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    text = f.read().strip()
+                # 支持 "total_registered 7" 或纯 "7" 两种格式
+                for tok in text.replace(",", " ").split():
+                    if tok.isdigit():
+                        return int(tok)
+            except Exception as e:
+                print(f"[警告] 读取 {cand} 失败: {e}")
+                return None
+    return None
 
 
 def imread_cn(path):
@@ -310,25 +331,33 @@ def _rects_overlap(a, b):
 
 
 def draw_boxes_with_labels(img, dets, labels):
-    """画框 + 智能放置标签（带底纹，避免互相遮挡）。
+    """画框 + 智能放置标签（细框细字，避免互相遮挡）。
 
-    默认放框正上方；若与其他框或已放标签重叠，依次尝试下方(高低两档)、
-    框内顶部、左/右侧，并给每个标签加黑色底纹，靠近时也能看清。
+    框线宽 1、字号 0.4/线宽 1，适合目标多、框密的情况。
+    标签默认放框正上方；若与其他框或已放标签重叠，依次尝试下方(高低两档)、
+    框内顶部、左/右侧，并给每个标签加半透明黑色底纹，保证可读且不遮挡。
     """
+    FONT = cv2.FONT_HERSHEY_SIMPLEX
+    SCALE = 0.4
+    THICK = 1
+    BOX_THICK = 1
+
+    # 先画所有框（细框）
     for (x1, y1, x2, y2) in dets:
-        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), BOX_THICK)
 
     placed = []  # 已放置标签的矩形，避免标签之间互相遮挡
     for idx, ((x1, y1, x2, y2), label) in enumerate(zip(dets, labels)):
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+        (tw, th), _ = cv2.getTextSize(label, FONT, SCALE, THICK)
+        # 候选位置：上/下/框内/左/右，细框下给更密的候选档
         candidates = [
-            (x1, y1 - th - 4),        # 上方(贴近)
-            (x1, y1 - th - 16),       # 上方(更高)
-            (x1, y2 + 4),             # 下方(贴近)
-            (x1, y2 + 16),            # 下方(更低)
+            (x1, y1 - th - 3),        # 上方(贴近)
+            (x1, y1 - th - 11),       # 上方(更高)
+            (x1, y2 + 3),             # 下方(贴近)
+            (x1, y2 + 11),            # 下方(更低)
             (x1 + 2, y1 + th + 2),    # 框内顶部
-            (x1 - tw - 4, y1 + th),   # 左侧
-            (x2 + 4, y1 + th),        # 右侧
+            (x1 - tw - 3, y1 + th),   # 左侧
+            (x2 + 3, y1 + th),        # 右侧
         ]
         chosen = candidates[0]
         for (lx, ly) in candidates:
@@ -339,10 +368,12 @@ def draw_boxes_with_labels(img, dets, labels):
                 continue
             chosen = (lx, ly)
             break
-        # 黑色底纹 + 绿色文字，保证可读性
+        # 半透明黑色底纹 + 绿色细字，保证可读性且不压住其他框
         lx, ly = chosen
-        cv2.rectangle(img, (lx - 2, ly - th - 2), (lx + tw + 2, ly + 2), (0, 0, 0), -1)
-        cv2.putText(img, label, chosen, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        ov = img[ly:ly + th, lx:lx + tw]
+        if ov.size > 0:
+            img[ly:ly + th, lx:lx + tw] = cv2.addWeighted(ov, 0.4, np.zeros_like(ov), 0.6, 0)
+        cv2.putText(img, label, (lx, ly + th), FONT, SCALE, (0, 255, 0), THICK)
         placed.append((lx, ly, lx + tw, ly + th))
 
 
@@ -354,6 +385,11 @@ images = sorted([
     f for f in os.listdir(IMAGE_DIR)
     if f.lower().endswith((".jpg", ".png", ".jpeg", ".bmp"))
 ])
+
+# 读取人工核实的实际总人数（可选，用于快速判断计数准确度）
+ACTUAL_COUNT = read_actual_count(IMAGE_DIR)
+if ACTUAL_COUNT is not None:
+    print(f"[INFO] 人工核实实际人数 = {ACTUAL_COUNT}（来自 {IMAGE_DIR}/total_registered.txt）")
 
 print(f"[START] 协同运动预测头肩追踪器已激活。")
 
@@ -378,6 +414,9 @@ for i, name in enumerate(images):
 
     display_labels = tracker.update(dets, feats, confs)
 
+    # 标签带置信度：Passenger_ID:3 0.92（细框细字渲染，防遮挡）
+    render_labels = [f"{lbl} {c:.2f}" for lbl, c in zip(display_labels, confs)]
+
     ids_in_frame = [lbl.split(":")[-1] for lbl in display_labels]
     det_str = ", ".join(f"({d[0]},{d[1]})c={c:.2f}" for d, c in zip(dets, confs))
     print(f"[{i}/{len(images)}] {name} -> IDs = {ids_in_frame}")
@@ -385,13 +424,18 @@ for i, name in enumerate(images):
     print(f"      ransac shift=({tracker.global_shift[0]:.0f},{tracker.global_shift[1]:.0f}) inliers={tracker.shift_inliers}")
 
     # 智能标签放置（改动3：标签默认放框上方，重叠时自动换到其他方向）
-    draw_boxes_with_labels(img, dets, display_labels)
+    draw_boxes_with_labels(img, dets, render_labels)
 
     v_str = f"RANSAC Shift: dx={tracker.global_shift[0]:.1f}, dy={tracker.global_shift[1]:.1f} (inliers={tracker.shift_inliers})"
     cv2.putText(img, v_str, (20, img.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
 
     cv2.putText(img, f"Total Registered Passengers: {tracker.total_count()}", (20, 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    if ACTUAL_COUNT is not None:
+        diff = tracker.total_count() - ACTUAL_COUNT
+        color = (0, 255, 0) if diff == 0 else ((0, 165, 255) if abs(diff) <= 1 else (0, 0, 255))
+        cv2.putText(img, f"Actual: {ACTUAL_COUNT}  Diff: {diff:+d}", (20, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
     cv2.imwrite(os.path.join(OUTPUT_DIR, name), img)
     if (i + 1) % 10 == 0 or (i + 1) == len(images):
@@ -399,4 +443,8 @@ for i, name in enumerate(images):
 
 print("\n" + "=" * 40)
 print(f" 🏆 纯头肩检测运动协同去重最终总人数: {tracker.total_count()}")
+if ACTUAL_COUNT is not None:
+    diff = tracker.total_count() - ACTUAL_COUNT
+    status = "准确" if diff == 0 else (f"偏差{diff:+d}" if abs(diff) <= 1 else f"偏差较大{diff:+d}")
+    print(f" 📌 人工核实实际人数: {ACTUAL_COUNT}，差值 {diff:+d}（{status}）")
 print("=" * 40)

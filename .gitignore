@@ -211,3 +211,6 @@ results.csv
 fuzz-sources/
 fuzz-datasets/
 fuzz-models/
+
+# Tracking output (frame result images + logs, too large for version control)
+target tracking/tracking_output/
