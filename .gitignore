@@ -214,3 +214,4 @@ fuzz-models/
 
 # Tracking output (frame result images + logs, too large for version control)
 target tracking/tracking_output/
+target tracking/tracking_output-标注人数版本/

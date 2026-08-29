@@ -39,8 +39,8 @@ except Exception:
 # ================= 路径 =================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = r"D:/桌面文件/文档素材/东南大学/1.学术相关/车辆超员检测项目/YOLO/target detection/run_3class/weights/best.pt"
-DATA_ROOT = r"F:/车辆超员检测项目数据集/超员原图0729"
-OUT_ROOT = os.path.join(BASE_DIR, "tracking_output")
+DATA_ROOT = r"F:/车辆超员检测项目数据集/超员原图0729-标注人数版本"
+OUT_ROOT = r"D:/桌面文件/文档素材/东南大学/1.学术相关/车辆超员检测项目/YOLO/target tracking/tracking_output-标注人数版本"
 
 CLASS_NAMES = {0: 'car', 1: 'head', 2: 'window'}
 
@@ -845,7 +845,7 @@ def main():
         print(f"[结果] 预测={pred} 实际={actual} 差={diff} 每窗={win}")
         return
 
-    # 批量模式：优先读 dev_seqs.txt 开发集清单；文件不存在则回退前 12 个序列
+    # 批量模式：只跑 21 个无后缀序列（带后缀的为数据质量较差样本，本轮不跑）
     os.makedirs(OUT_ROOT, exist_ok=True)
     today = datetime.now().strftime("%Y%m%d")
     existing = [d for d in os.listdir(OUT_ROOT) if d.startswith(today + "_")]
@@ -870,19 +870,8 @@ def main():
         log_f.write(msg + "\n")
         log_f.flush()
 
-    seq_file = os.path.join(BASE_DIR, "dev_seqs.txt")
-    if os.path.exists(seq_file):
-        seqs = []
-        with open(seq_file, encoding="utf-8") as f:
-            for line in f:
-                name = line.strip()
-                if not name or name.startswith("#"):
-                    continue
-                if os.path.isdir(os.path.join(DATA_ROOT, name)):
-                    seqs.append(name)
-        print(f"[开发集清单] {seq_file} 共 {len(seqs)} 个序列")
-    else:
-        seqs = sorted([d for d in os.listdir(DATA_ROOT) if os.path.isdir(os.path.join(DATA_ROOT, d))])[:12]
+    # 无后缀 = 数据质量较好；带后缀（-small target/-blurry head/-bully head/-target overlap）本轮排除
+    seqs = sorted([d for d in os.listdir(DATA_ROOT) if os.path.isdir(os.path.join(DATA_ROOT, d)) and "-" not in d])
 
     results = []
     for seq in seqs:
