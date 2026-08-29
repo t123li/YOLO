@@ -1,19 +1,17 @@
 # -*- coding: utf-8 -*-
-"""D 方案 v4：3 类检测 + 车窗跨帧跟踪(稳定窗ID) + 运动补偿&OSNet 人跟踪 + 窗口绑定(不跳窗)。
+"""D 方案：3 类检测 + 车窗跨帧跟踪(稳定窗ID) + 运动补偿&OSNet 人跟踪 + 窗口绑定(不跳窗)。
 
 分层（每层解决一个问题）：
-1. 【车窗跨帧跟踪】车窗刚性固定、随车整体运动，用"离车头的物理槽位"跨帧匹配稳定 ID。
-   车头方向由首帧贴边启发式 + 位移确认判断，前窗=槽0，中间插入新窗不影响已有槽位。
-2. 【人 = 运动补偿 + OSNet】RANSAC 估计整车平移 + 速度预测 + OSNet 外观（已修 BGR→RGB）。
-3. 【窗口绑定】人 ID 首次出现绑定所在车窗，此后只允许出现在绑定窗内（不跳窗）。
-4. 【v4 新增】
-   - 匈牙利全局匹配：阶段一用 scipy 线性分配替代贪心，杜绝聚集时抢 ID。
-   - 窗内顺序保持：同窗 rel_x 差 >0.35 窗宽禁止匹配，防止相邻目标 ID 互换。
-   - 生命周期：新轨迹 Tentative（渲染标"?"、橙色），累计观测 >=2 帧转 Confirmed 才计数。
-   - 座位槽硬约束：每窗确认人数 <= SEATS_PER_WINDOW(3)，窗满不建新 ID。
-   - 两级关联：predict conf=0.05 多检；高分(>=0.35)可建新轨迹，低分只延续（不新建）。
+1. 【车窗跨帧跟踪】车窗刚性固定、随车整体运动，是全场最易跨帧匹配的目标。
+   用"车锚定坐标"(窗口中心相对车框的归一化 x) 做跨帧匹配，给车窗分配稳定 ID。
+   不再像 C 方案那样每帧按 x 重新排序给索引（窗漏检时索引会错位 → 人绑定全乱）。
+2. 【人 = 运动补偿 + OSNet】原样沿用 sideview_headshoulder_counter.py 的
+   MotionCoherentTracker：RANSAC 估计整车平移(GMC 简化版) + 速度预测 + OSNet 外观。
+   能处理人的独立运动（前倾/后仰/转头 → 相对车窗的位置漂移）。
+3. 【窗口绑定】人 ID 首次出现时记录所在车窗，此后该 ID 只允许出现在绑定窗内
+   （同帧、跨帧都不跳窗）。某帧绑定窗漏检时放宽约束（无法验证窗），仍靠外观+运动兜底。
 
-计数：全局唯一 confirmed person ID 数 = 车内人数；每窗 confirmed 数 = 每窗人数。
+计数：全局唯一 person ID 数 = 车内人数；每窗唯一 person ID 数 = 每窗人数。
 
 用法：
     # 批量（前 12 个序列，输出到 tracking_output/日期_序号/源序列名/）
@@ -47,8 +45,7 @@ OUT_ROOT = os.path.join(BASE_DIR, "tracking_output")
 CLASS_NAMES = {0: 'car', 1: 'head', 2: 'window'}
 
 # ================= 检测配置 =================
-CONF_HEAD = 0.10    # head 低阈值（多检，含遮挡/小头低分真检测；误检交给生命周期+两级关联过滤）
-CONF_HEAD_HIGH = 0.35  # 高分阈值：>= 此值才允许新建轨迹（低分框只延续不新建）
+CONF_HEAD = 0.15    # head 阈值（3类模型 head_shoulder；降低以召回遮挡/小目标，误检交给确认机制）
 CONF_WIN = 0.20     # window 阈值
 CONF_CAR = 0.30     # car 阈值
 PRED_CONF = 0.2     # 预测底层 conf（之后按类过滤）
@@ -71,12 +68,6 @@ SIM_GATE = 0.55      # 阶段一外观相似度门限（3类模型 head 框小�
 # 车窗跨帧跟踪：用"窗在车身的位置(relx)"贪心匹配（相邻窗 relx 差约 0.1-0.3，0.2 不会错配）
 WIN_ASSOC_RELX = 0.20     # relx 匹配门限（窗相对车框归一化 x 的距离）
 WIN_TRACK_MAX_AGE = 5     # 车窗轨迹最大丢失帧数
-# 座位槽硬约束：每窗最多允许的确认人数（前/中/后窗各≤3），窗满时不新建 ID
-SEATS_PER_WINDOW = 3
-# tracklet 合并（治 ID 分裂：同一人跨帧关联失败被给两个 ID）
-MERGE_MAX_GAP = 2        # 两个 tracklet 最大允许间隔帧数（≤此值才可能合并）
-MERGE_REL_X_DIST = 0.12  # 窗内 rel_x 最大差（须位置极近才可能合并，防误并相邻座）
-MERGE_SIM = 0.80         # 外观余弦相似度阈值（收紧防误并）
 
 # ================= 工具 =================
 
@@ -280,7 +271,6 @@ class HeadShoulderTrack:
         self.bound_window = win                    # 绑定车窗 ID（None=尚未在窗内见过）
         self.rel_pos = None                        # 最近一次"窗内归一化坐标 (rel_x, rel_y)"
         self.bound_bbox = None                     # 绑定时所在窗的框，用于计算窗内 rel
-        self.in_win_rank = None                    # 窗内排名（同窗按 rel_x 排序的名次，跨帧顺序保持）
 
 
 class MotionCoherentTracker:
@@ -296,9 +286,7 @@ class MotionCoherentTracker:
         self.next_global_id = 0
         self.global_id_history = {}   # { gid: deque([feat,...], maxlen=5) }
         self.gid_hits = {}            # { gid: 累计观测帧数 }，确认机制用
-        self.gid_min_hits = {}        # { gid: 确认所需最小帧数 }（低分框需更多帧确认）
         self.gid_window = {}          # { gid: 绑定窗ID 或 None }
-        self.tracklet_info = {}       # { gid: {'win':窗ID, 'frames':[fi,...], 'relxs':[(rx,ry),...], 'feats':[feat,...]} }，供 tracklet 合并
         self.global_vehicle_velocity = np.array([0.0, 0.0])
         self.global_shift = np.array([0.0, 0.0])     # RANSAC 估计的整车帧间平移
         self.shift_inliers = 0
@@ -339,12 +327,9 @@ class MotionCoherentTracker:
         hc = get_center(det)
         return ((hc[0] - win_box[0]) / ww, (hc[1] - win_box[1]) / wh)
 
-    def update(self, dets, feats, confs, wins, win_boxes, allow_new=None, fi=0):
+    def update(self, dets, feats, confs, wins, win_boxes):
         """wins[i]: 第 i 个检测所在的车窗 ID（或 None）；win_boxes: {wid: 当前帧窗框}。
-        allow_new[i]: 该检测是否允许新建轨迹（低分框只延续不新建，ByteTrack 两级关联思想）。
-        fi: 当前帧索引（tracklet 合并记录用）。返回 (gids, wins_out)。"""
-        if allow_new is None:
-            allow_new = [True] * len(dets)
+        返回 (gids, wins_out)。"""
         for t in self.tracks:
             t.age += 1
 
@@ -356,10 +341,6 @@ class MotionCoherentTracker:
 
         # 每个检测的窗内 rel 坐标（窗口丢失时为 None，回退全局位置）
         rels = [self._rel_in_win(det, win_boxes.get(w) if w is not None else None) for det, w in zip(dets, wins)]
-
-        # 维护轨迹窗内 rel_x（供阶段一"窗内顺序保持"约束使用）
-        for t in self.tracks:
-            t.in_win_rank = t.rel_pos[0] if (t.bound_window is not None and t.rel_pos is not None) else None
 
         # ---- GMC 简化版：RANSAC 整车平移（全局通道用） ----
         self.global_shift, self.shift_inliers = self._estimate_global_shift(dets)
@@ -391,27 +372,18 @@ class MotionCoherentTracker:
                     return np.hypot((rx - trx) * ww, (ry - try_) * (wb[3] - wb[1])), True
             return np.linalg.norm(np.array(get_center(dets[i])) - predicted_centers[j]), False
 
-        # ---- 阶段一：位置 + 外观 双指标配对（含窗口绑定硬约束，匈牙利全局最优） ----
-        # 构建代价矩阵 cost[i][j]（大数 = 不匹配），scipy 匈牙利求全局最小总代价的一对一分配。
-        # 用大数而非 np.inf，避免 "cost matrix is infeasible"；分配后过滤掉落在 BIG 上的匹配。
-        from scipy.optimize import linear_sum_assignment
-        BIG = 1e6
-        n_dets = len(dets)
-        n_trks = len(self.tracks)
-        cost = np.full((n_dets, n_trks), BIG)
+        # ---- 阶段一：位置 + 外观 双指标配对（含窗口绑定硬约束） ----
+        matches = []
         for i, det in enumerate(dets):
             d_cx, d_cy = get_center(det)
             c = confs[i]
             s_c = (c * c) / (c * c + (1.0 - c) * (1.0 - c))
             w_m = 0.2 + 0.3 * s_c
             for j, t in enumerate(self.tracks):
+                if j in matched_tracks:
+                    continue
                 if not self._win_ok(wins[i], t.bound_window):
                     continue
-                # 窗内顺序保持：同窗时，检测 rel_x 与轨迹 rel_x 差 >0.35 窗宽则禁止
-                # （人在窗内 rel_x 跨帧漂移有限，差太大说明顺序错位 → 防止相邻目标 ID 互换）
-                if wins[i] is not None and t.bound_window == wins[i] and rels[i] is not None and t.rel_pos is not None:
-                    if abs(rels[i][0] - t.rel_pos[0]) > 0.35:
-                        continue
                 dist, is_rel = pair_dist(i, j)
                 gate = dist_gate if not is_rel else max(0.35 * (win_boxes.get(wins[i])[2] - win_boxes.get(wins[i])[0]) if wins[i] in win_boxes else 120, 90)
                 sims = np.dot(np.array(t.feat_history), feats[i])
@@ -419,45 +391,39 @@ class MotionCoherentTracker:
                 if dist < gate and sim > SIM_GATE:
                     motion_score = 1.0 - dist / gate
                     score = w_m * motion_score + (1.0 - w_m) * sim
-                    cost[i, j] = 1.0 - score   # score 高 → cost 低
+                    matches.append((score, i, j, dist, sim, is_rel))
 
-        assigned_indices = [-1] * len(dets)
-        matched_tracks = set()
-        if n_dets > 0 and n_trks > 0 and (cost < BIG / 2).any():
-            row_ind, col_ind = linear_sum_assignment(cost)
-            for r, c in zip(row_ind, col_ind):
-                if cost[r, c] < BIG / 2:   # 只接受真实候选，丢弃落在 BIG 上的
-                    assigned_indices[r] = c
-                    matched_tracks.add(c)
+        matches.sort(key=lambda x: x[0], reverse=True)
 
         velocity_samples = []
 
-        for i, j in enumerate(assigned_indices):
-            if j == -1:
-                continue
-            t = self.tracks[j]
-            old_cx, old_cy = get_center(t.bbox)
-            new_cx, new_cy = get_center(dets[i])
-            inst_velocity = np.array([new_cx - old_cx, new_cy - old_cy])
+        for score, i, j, dist, sim, is_rel in matches:
+            if assigned_indices[i] == -1 and j not in matched_tracks:
+                assigned_indices[i] = j
+                matched_tracks.add(j)
 
-            w = float(np.clip(confs[i], 0.2, 0.9))
-            t.velocity = t.velocity * (1.0 - w) + inst_velocity * w
-            velocity_samples.append(t.velocity)
+                t = self.tracks[j]
+                old_cx, old_cy = get_center(t.bbox)
+                new_cx, new_cy = get_center(dets[i])
+                inst_velocity = np.array([new_cx - old_cx, new_cy - old_cy])
 
-            t.bbox = dets[i]
-            t.feat_history.append(feats[i])
-            t.age = 0
-            t.hits += 1
-            self.gid_hits[t.global_id] = self.gid_hits.get(t.global_id, 0) + 1
-            self._record_observation(t.global_id, fi, wins[i], rels[i], feats[i])
-            t.missed_shift = np.array([0.0, 0.0])
-            if wins[i] is not None:
-                t.bound_window = wins[i]
-                t.rel_pos = rels[i]
-                t.bound_bbox = win_boxes.get(wins[i])
-                self.gid_window[t.global_id] = wins[i]
-            elif t.rel_pos is None:
-                pass  # 仍无窗，保持未绑定
+                w = float(np.clip(confs[i], 0.2, 0.9))
+                t.velocity = t.velocity * (1.0 - w) + inst_velocity * w
+                velocity_samples.append(t.velocity)
+
+                t.bbox = dets[i]
+                t.feat_history.append(feats[i])
+                t.age = 0
+                t.hits += 1
+                self.gid_hits[t.global_id] = self.gid_hits.get(t.global_id, 0) + 1
+                t.missed_shift = np.array([0.0, 0.0])
+                if wins[i] is not None:
+                    t.bound_window = wins[i]
+                    t.rel_pos = rels[i]
+                    t.bound_bbox = win_boxes.get(wins[i])
+                    self.gid_window[t.global_id] = wins[i]
+                elif t.rel_pos is None:
+                    pass  # 仍无窗，保持未绑定
 
         # 更新全局车速
         if len(velocity_samples) > 0:
@@ -534,29 +500,17 @@ class MotionCoherentTracker:
                             matched_tracks.add(best_occ)
                             best_sim = 0.0
 
-            # 两级关联：低分框允许建轨迹，但用更高的确认门槛（生命周期 min_hits 按 conf 自适应）。
-            # 遮挡/小头的低分真检测能建 Tentative → 连续多帧确认后计数（补欠计数）；
-            # 头枕/反光的低分误检 1-2 帧闪现，达不到确认门槛 → 不计数（治过计数）。
-            if matched_gid == -1 and wins[i] is not None:
-                win_confirmed = sum(1 for t in self.tracks
-                                    if t.bound_window == wins[i] and t.global_id in self.confirmed_ids())
-                if win_confirmed >= SEATS_PER_WINDOW:
-                    continue   # 窗已满，跳过此检测（不建新 ID）
-
             if matched_gid == -1:
                 matched_gid = self.next_global_id
                 self.next_global_id += 1
                 self.global_id_history[matched_gid] = deque([det_feat], maxlen=5)
                 self.gid_hits[matched_gid] = 1
-                self.gid_min_hits[matched_gid] = 3 if confs[i] < CONF_HEAD_HIGH else 2  # 低分需更多帧确认
                 self.gid_window[matched_gid] = wins[i]   # 首次出现即绑定车窗
-                self._record_observation(matched_gid, fi, wins[i], rels[i], det_feat)
                 if wins[i] is not None:
                     pass  # bound_window 在新建 track 时设置
             else:
                 self.global_id_history[matched_gid].append(det_feat)
                 self.gid_hits[matched_gid] = self.gid_hits.get(matched_gid, 0) + 1
-                self._record_observation(matched_gid, fi, wins[i], rels[i], det_feat)
             claimed_gids.add(matched_gid)
 
             existing_idx = None
@@ -595,10 +549,6 @@ class MotionCoherentTracker:
         frame_gids = []
         frame_wins = []
         for idx in assigned_indices:
-            if idx == -1:
-                frame_gids.append(-1)   # 被座位槽抑制/未分配的检测，用 -1 标记，渲染时跳过
-                frame_wins.append(None)
-                continue
             t = self.tracks[idx]
             frame_gids.append(t.global_id)
             frame_wins.append(t.bound_window)
@@ -606,97 +556,13 @@ class MotionCoherentTracker:
         self.tracks = [t for t in self.tracks if t.age <= MAX_AGE]
         return frame_gids, frame_wins
 
-    def _record_observation(self, gid, fi, win, rel_pos, feat):
-        """记录一个 gid 在某帧的观测，供 tracklet 合并。"""
-        info = self.tracklet_info.setdefault(gid, {'win': win, 'frames': [], 'relxs': [], 'feats': []})
-        info['frames'].append(fi)
-        if rel_pos is not None:
-            info['relxs'].append(rel_pos)
-        info['feats'].append(feat)
-        if info['win'] is None and win is not None:
-            info['win'] = win
-
-    def merge_tracklets(self):
-        """离线合并分裂的 tracklet（同一人跨帧关联失败被给两个 ID）。
-
-        判据：同窗 + 时间相邻（间隔 ≤ MERGE_MAX_GAP）+ 窗内 rel_x 接近（< MERGE_REL_X_DIST）+ 外观相似。
-        合并后返回替代映射 {old_gid: keep_gid}，由调用方统一更新计数。
-        返回 (merge_map, final_count)。"""
-        gids = list(self.tracklet_info.keys())
-        if len(gids) < 2:
-            return {}, len(gids)
-        # 只合并"都在同一窗"且 rel_pos 已知的
-        candidates = [g for g in gids if self.tracklet_info[g]['relxs']]
-        parent = {g: g for g in candidates}   # 并查集
-        def find(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-        def union(a, b):
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[rb] = ra
-
-        def mean_feat(g):
-            return np.mean(np.array(self.tracklet_info[g]['feats']), axis=0)
-
-        for i in range(len(candidates)):
-            for j in range(i+1, len(candidates)):
-                a, b = candidates[i], candidates[j]
-                if find(a) == find(b):
-                    continue
-                ia, ib = self.tracklet_info[a], self.tracklet_info[b]
-                if ia['win'] is None or ib['win'] is None or ia['win'] != ib['win']:
-                    continue
-                fa, fb = ia['frames'], ib['frames']
-                sa, sb = set(fa), set(fb)
-                overlap = len(sa & sb)
-                # 允许少量时间重叠（分裂常发生在重叠的 1-2 帧）；重叠过多说明是两个真乘客
-                if overlap > MERGE_MAX_GAP:
-                    continue
-                # 时间相邻：一个结束与另一个开始（或重叠段）间隔 ≤ gap
-                gap = min(max(fa) - min(fb), max(fb) - min(fa))
-                if gap > MERGE_MAX_GAP:
-                    continue
-                # 窗内 rel_x 接近
-                ra = np.mean(ia['relxs'], axis=0)
-                rb = np.mean(ib['relxs'], axis=0)
-                if abs(ra[0] - rb[0]) > MERGE_REL_X_DIST:
-                    continue
-                # 外观相似
-                sim = float(np.dot(mean_feat(a), mean_feat(b)))
-                if sim > MERGE_SIM:
-                    union(a, b)
-
-        # 组内合并：保留最早出现的 gid
-        merge_map = {}
-        groups = {}
-        for g in candidates:
-            root = find(g)
-            groups.setdefault(root, []).append(g)
-        keep_ids = set()
-        for root, members in groups.items():
-            # 保留 frames 最早的（最早出现）作为代表
-            rep = min(members, key=lambda g: min(self.tracklet_info[g]['frames']))
-            keep_ids.add(rep)
-            for m in members:
-                if m != rep:
-                    merge_map[m] = rep
-        final_count = len(keep_ids)
-        return merge_map, final_count
-
-    def confirmed_ids(self):
-        """计入计数的 ID 集合：所有出现过的唯一 ID（含只露 1 帧的乘客）。
-        欠计数是主要矛盾，不能过滤单帧真乘客；过计数由座位槽 + 匈牙利 + 窗内顺序保持治理。"""
-        return set(self.gid_hits.keys())
-
-    def tentative_ids(self):
-        """渲染标"?"的 ID 集合：本帧首次出现、尚未在上一帧见过的 ID（提示"刚出现"）。"""
-        return set()
+    def confirmed_ids(self, min_hits=2):
+        """确认过的 ID 集合：累计观测 >= min_hits 帧的 ID（单帧碎片不确认）。"""
+        return {gid for gid, h in self.gid_hits.items() if h >= min_hits}
 
     def total_count(self):
-        """累计唯一人数：所有出现过的唯一 ID 数（只露 1 帧的乘客也计入，不欠计数）。"""
+        """累计唯一人数：所有出现过的唯一 ID 数（渲染有框就立即计数，不滞后）。
+        过计数由跟踪器的 ID 关联质量治理，而非"晚统计"。"""
         return len(self.gid_hits)
 
 
@@ -707,24 +573,22 @@ def _rects_overlap(a, b):
 
 
 def render_frame(img, car_box, windows, head_dets, actual_count, pred_count):
-    """渲染：车绿框、车窗黄框(含人数)、head 框（红=确认,橙=Tentative带?）。细框细字防遮挡。"""
+    """渲染：车绿框、车窗黄框(含人数)、head 红框(只显示 ID)。细框细字防遮挡。"""
     out = img.copy()
     FONT = cv2.FONT_HERSHEY_SIMPLEX
     SCALE = 0.4; THICK = 1
 
-    # head 框：红=确认(计数)，橙=Tentative(未确认,标 h{id}? 不计数)
+    # head 框（红），标签只显示全局 ID：h{id}（不显示置信度）
     if head_dets:
         placed = []
         dets = []
         labels = []
-        colors = []
-        for hb, gid, is_conf in head_dets:
+        for hb, gid in head_dets:
             dets.append((int(hb[0]), int(hb[1]), int(hb[2]), int(hb[3])))
-            labels.append(f"h{gid}" if is_conf else f"h{gid}?")
-            colors.append((0, 0, 255) if is_conf else (0, 165, 255))  # 红 / 橙
-        for (x1, y1, x2, y2), c in zip(dets, colors):
-            cv2.rectangle(out, (x1, y1), (x2, y2), c, THICK)
-        for idx, ((x1, y1, x2, y2), label, c) in enumerate(zip(dets, labels, colors)):
+            labels.append(f"h{gid}")
+        for (x1, y1, x2, y2) in dets:
+            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 0, 255), THICK)
+        for idx, ((x1, y1, x2, y2), label) in enumerate(zip(dets, labels)):
             (tw, th), _ = cv2.getTextSize(label, FONT, SCALE, THICK)
             candidates = [(x1, y1-th-3), (x1, y1-th-11), (x1, y2+3), (x1, y2+11),
                           (x1+2, y1+th+2), (x1-tw-3, y1+th), (x2+3, y1+th)]
@@ -740,7 +604,7 @@ def render_frame(img, car_box, windows, head_dets, actual_count, pred_count):
             ov = out[ly:ly+th, lx:lx+tw]
             if ov.size > 0:
                 out[ly:ly+th, lx:lx+tw] = cv2.addWeighted(ov, 0.4, np.zeros_like(ov), 0.6, 0)
-            cv2.putText(out, label, (lx, ly+th), FONT, SCALE, c, THICK)
+            cv2.putText(out, label, (lx, ly+th), FONT, SCALE, (0, 0, 255), THICK)
             placed.append((lx, ly, lx+tw, ly+th))
 
     # 车窗框（黄），标签 win{wid}:{count}
@@ -809,8 +673,6 @@ class SimpleCarTracker:
 # ================= 特征提取 =================
 
 def extract_feat(img_crop, reid_model, transform, device):
-    # OSNet 按 RGB 预训练，img_crop 来自 BGR 图像裁剪 → 先转 RGB，否则特征系统性失真
-    img_crop = cv2.cvtColor(img_crop, cv2.COLOR_BGR2RGB)
     img = transform(img_crop).unsqueeze(0).to(device)
     with torch.no_grad():
         feat = reid_model(img)
@@ -887,7 +749,7 @@ def process_sequence(model, reid_model, transform, device, seq, out_sub):
             continue
         img_h, img_w = img.shape[:2]
 
-        r = model.predict(img, conf=0.05, iou=IOU_NMS, imgsz=IMG_SIZE, verbose=False)[0]
+        r = model.predict(img, conf=PRED_CONF, iou=IOU_NMS, imgsz=IMG_SIZE, verbose=False)[0]
 
         boxes_by_cls = {c: {'boxes': [], 'scores': []} for c in CLASS_NAMES}
         for box in r.boxes:
@@ -936,37 +798,26 @@ def process_sequence(model, reid_model, transform, device, seq, out_sub):
             confs.append(head_scores[i])
             hc = box_center(hb)
             wins.append(next((wid for wid, wb in windows if point_in_box(hc, wb)), None))
-        # 两级关联：高分框允许新建轨迹，低分框只延续（allow_new=False）
-        allow_new = [c >= CONF_HEAD_HIGH for c in confs]
 
-        gids, frame_wins = person_tracker.update(dets, feats, confs, wins, win_boxes, allow_new=allow_new, fi=fi)
-        confirmed = person_tracker.confirmed_ids()
+        gids, frame_wins = person_tracker.update(dets, feats, confs, wins, win_boxes)
         for gid, w in zip(gids, frame_wins):
-            if w is not None and gid in confirmed:
+            if w is not None:
                 window_seen[w].add(gid)
         pred_count = person_tracker.total_count()
 
-        # head_dets 带确认标记：True=确认, False=Tentative(渲染标"?"，不计数)；gid=-1 的座位槽抑制检测跳过
-        head_dets = [(dets[i], gids[i], gids[i] in confirmed) for i in range(len(dets)) if gids[i] != -1]
-        # 每窗人数 = 本帧落在该窗的确认 head 数（与 pred 一致；Tentative 不计）
+        head_dets = [(dets[i], gids[i]) for i in range(len(dets))]
+        # 每窗人数 = 本帧落在该窗的 head 检测数（当前帧可见人数，不做确认过滤，避免滞后）
         frame_win_counts = {}
         for gid, w in zip(gids, frame_wins):
-            if w is not None and gid in confirmed:
+            if w is not None:
                 frame_win_counts[w] = frame_win_counts.get(w, 0) + 1
         win_draw = [(wid, wb, frame_win_counts.get(wid, 0)) for wid, wb in windows]
         out_img = render_frame(img, car_box, win_draw, head_dets,
                                actual_count if actual_count is not None else -1, pred_count)
         cv2.imencode('.jpg', out_img)[1].tofile(os.path.join(out_sub, name))
 
-    # 序列结束：离线合并分裂的 tracklet（治 ID 分裂），用合并后的计数
-    merge_map, merged_count = person_tracker.merge_tracklets()
-    if merge_map:
-        # 每窗人数也按合并映射去重
-        merged_win = {}
-        for wid, gidset in window_seen.items():
-            merged_win[wid] = {merge_map.get(g, g) for g in gidset}
-        window_seen = merged_win
-    return merged_count, actual_count, {wid: len(win_seen) for wid, win_seen in window_seen.items()}
+    total = person_tracker.total_count()
+    return total, actual_count, {wid: len(win_seen) for wid, win_seen in window_seen.items()}
 
 
 def main():
