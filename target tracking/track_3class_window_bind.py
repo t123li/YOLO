@@ -599,18 +599,17 @@ class MotionCoherentTracker:
         return frame_gids, frame_wins
 
     def confirmed_ids(self):
-        """确认过的 ID 集合：累计观测 >= 2 帧即确认（短序列 8 帧，低分乘客可能只露 2-3 帧；
-        过计数由座位槽 + 生命周期共同治理，不靠提高确认门槛）。"""
-        return {gid for gid, h in self.gid_hits.items() if h >= 2}
+        """计入计数的 ID 集合：所有出现过的唯一 ID（含只露 1 帧的乘客）。
+        欠计数是主要矛盾，不能过滤单帧真乘客；过计数由座位槽 + 匈牙利 + 窗内顺序保持治理。"""
+        return set(self.gid_hits.keys())
 
     def tentative_ids(self):
-        """未确认的 ID 集合（只出现 1 帧）：渲染时标"?"，不计数。"""
-        return {gid for gid, h in self.gid_hits.items() if h < 2}
+        """渲染标"?"的 ID 集合：本帧首次出现、尚未在上一帧见过的 ID（提示"刚出现"）。"""
+        return set()
 
     def total_count(self):
-        """累计唯一人数：只统计确认过的 ID（出现 >= 2 帧）。
-        头枕/反光等单帧闪现误检是 Tentative，不计入。"""
-        return len(self.confirmed_ids())
+        """累计唯一人数：所有出现过的唯一 ID 数（只露 1 帧的乘客也计入，不欠计数）。"""
+        return len(self.gid_hits)
 
 
 # ================= 渲染 =================
