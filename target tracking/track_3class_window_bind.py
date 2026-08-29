@@ -73,6 +73,10 @@ WIN_ASSOC_RELX = 0.20     # relx 匹配门限（窗相对车框归一化 x 的�
 WIN_TRACK_MAX_AGE = 5     # 车窗轨迹最大丢失帧数
 # 座位槽硬约束：每窗最多允许的确认人数（前/中/后窗各≤3），窗满时不新建 ID
 SEATS_PER_WINDOW = 3
+# tracklet 合并（治 ID 分裂：同一人跨帧关联失败被给两个 ID）
+MERGE_MAX_GAP = 2        # 两个 tracklet 最大允许间隔帧数（≤此值才可能合并）
+MERGE_REL_X_DIST = 0.12  # 窗内 rel_x 最大差（须位置极近才可能合并，防误并相邻座）
+MERGE_SIM = 0.80         # 外观余弦相似度阈值（收紧防误并）
 
 # ================= 工具 =================
 
@@ -294,6 +298,7 @@ class MotionCoherentTracker:
         self.gid_hits = {}            # { gid: 累计观测帧数 }，确认机制用
         self.gid_min_hits = {}        # { gid: 确认所需最小帧数 }（低分框需更多帧确认）
         self.gid_window = {}          # { gid: 绑定窗ID 或 None }
+        self.tracklet_info = {}       # { gid: {'win':窗ID, 'frames':[fi,...], 'relxs':[(rx,ry),...], 'feats':[feat,...]} }，供 tracklet 合并
         self.global_vehicle_velocity = np.array([0.0, 0.0])
         self.global_shift = np.array([0.0, 0.0])     # RANSAC 估计的整车帧间平移
         self.shift_inliers = 0
@@ -334,10 +339,10 @@ class MotionCoherentTracker:
         hc = get_center(det)
         return ((hc[0] - win_box[0]) / ww, (hc[1] - win_box[1]) / wh)
 
-    def update(self, dets, feats, confs, wins, win_boxes, allow_new=None):
+    def update(self, dets, feats, confs, wins, win_boxes, allow_new=None, fi=0):
         """wins[i]: 第 i 个检测所在的车窗 ID（或 None）；win_boxes: {wid: 当前帧窗框}。
         allow_new[i]: 该检测是否允许新建轨迹（低分框只延续不新建，ByteTrack 两级关联思想）。
-        返回 (gids, wins_out)。"""
+        fi: 当前帧索引（tracklet 合并记录用）。返回 (gids, wins_out)。"""
         if allow_new is None:
             allow_new = [True] * len(dets)
         for t in self.tracks:
@@ -444,6 +449,7 @@ class MotionCoherentTracker:
             t.age = 0
             t.hits += 1
             self.gid_hits[t.global_id] = self.gid_hits.get(t.global_id, 0) + 1
+            self._record_observation(t.global_id, fi, wins[i], rels[i], feats[i])
             t.missed_shift = np.array([0.0, 0.0])
             if wins[i] is not None:
                 t.bound_window = wins[i]
@@ -544,11 +550,13 @@ class MotionCoherentTracker:
                 self.gid_hits[matched_gid] = 1
                 self.gid_min_hits[matched_gid] = 3 if confs[i] < CONF_HEAD_HIGH else 2  # 低分需更多帧确认
                 self.gid_window[matched_gid] = wins[i]   # 首次出现即绑定车窗
+                self._record_observation(matched_gid, fi, wins[i], rels[i], det_feat)
                 if wins[i] is not None:
                     pass  # bound_window 在新建 track 时设置
             else:
                 self.global_id_history[matched_gid].append(det_feat)
                 self.gid_hits[matched_gid] = self.gid_hits.get(matched_gid, 0) + 1
+                self._record_observation(matched_gid, fi, wins[i], rels[i], det_feat)
             claimed_gids.add(matched_gid)
 
             existing_idx = None
@@ -597,6 +605,86 @@ class MotionCoherentTracker:
 
         self.tracks = [t for t in self.tracks if t.age <= MAX_AGE]
         return frame_gids, frame_wins
+
+    def _record_observation(self, gid, fi, win, rel_pos, feat):
+        """记录一个 gid 在某帧的观测，供 tracklet 合并。"""
+        info = self.tracklet_info.setdefault(gid, {'win': win, 'frames': [], 'relxs': [], 'feats': []})
+        info['frames'].append(fi)
+        if rel_pos is not None:
+            info['relxs'].append(rel_pos)
+        info['feats'].append(feat)
+        if info['win'] is None and win is not None:
+            info['win'] = win
+
+    def merge_tracklets(self):
+        """离线合并分裂的 tracklet（同一人跨帧关联失败被给两个 ID）。
+
+        判据：同窗 + 时间相邻（间隔 ≤ MERGE_MAX_GAP）+ 窗内 rel_x 接近（< MERGE_REL_X_DIST）+ 外观相似。
+        合并后返回替代映射 {old_gid: keep_gid}，由调用方统一更新计数。
+        返回 (merge_map, final_count)。"""
+        gids = list(self.tracklet_info.keys())
+        if len(gids) < 2:
+            return {}, len(gids)
+        # 只合并"都在同一窗"且 rel_pos 已知的
+        candidates = [g for g in gids if self.tracklet_info[g]['relxs']]
+        parent = {g: g for g in candidates}   # 并查集
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        def mean_feat(g):
+            return np.mean(np.array(self.tracklet_info[g]['feats']), axis=0)
+
+        for i in range(len(candidates)):
+            for j in range(i+1, len(candidates)):
+                a, b = candidates[i], candidates[j]
+                if find(a) == find(b):
+                    continue
+                ia, ib = self.tracklet_info[a], self.tracklet_info[b]
+                if ia['win'] is None or ib['win'] is None or ia['win'] != ib['win']:
+                    continue
+                fa, fb = ia['frames'], ib['frames']
+                sa, sb = set(fa), set(fb)
+                overlap = len(sa & sb)
+                # 允许少量时间重叠（分裂常发生在重叠的 1-2 帧）；重叠过多说明是两个真乘客
+                if overlap > MERGE_MAX_GAP:
+                    continue
+                # 时间相邻：一个结束与另一个开始（或重叠段）间隔 ≤ gap
+                gap = min(max(fa) - min(fb), max(fb) - min(fa))
+                if gap > MERGE_MAX_GAP:
+                    continue
+                # 窗内 rel_x 接近
+                ra = np.mean(ia['relxs'], axis=0)
+                rb = np.mean(ib['relxs'], axis=0)
+                if abs(ra[0] - rb[0]) > MERGE_REL_X_DIST:
+                    continue
+                # 外观相似
+                sim = float(np.dot(mean_feat(a), mean_feat(b)))
+                if sim > MERGE_SIM:
+                    union(a, b)
+
+        # 组内合并：保留最早出现的 gid
+        merge_map = {}
+        groups = {}
+        for g in candidates:
+            root = find(g)
+            groups.setdefault(root, []).append(g)
+        keep_ids = set()
+        for root, members in groups.items():
+            # 保留 frames 最早的（最早出现）作为代表
+            rep = min(members, key=lambda g: min(self.tracklet_info[g]['frames']))
+            keep_ids.add(rep)
+            for m in members:
+                if m != rep:
+                    merge_map[m] = rep
+        final_count = len(keep_ids)
+        return merge_map, final_count
 
     def confirmed_ids(self):
         """计入计数的 ID 集合：所有出现过的唯一 ID（含只露 1 帧的乘客）。
@@ -851,9 +939,8 @@ def process_sequence(model, reid_model, transform, device, seq, out_sub):
         # 两级关联：高分框允许新建轨迹，低分框只延续（allow_new=False）
         allow_new = [c >= CONF_HEAD_HIGH for c in confs]
 
-        gids, frame_wins = person_tracker.update(dets, feats, confs, wins, win_boxes, allow_new=allow_new)
+        gids, frame_wins = person_tracker.update(dets, feats, confs, wins, win_boxes, allow_new=allow_new, fi=fi)
         confirmed = person_tracker.confirmed_ids()
-        tentative = person_tracker.tentative_ids()
         for gid, w in zip(gids, frame_wins):
             if w is not None and gid in confirmed:
                 window_seen[w].add(gid)
@@ -871,8 +958,15 @@ def process_sequence(model, reid_model, transform, device, seq, out_sub):
                                actual_count if actual_count is not None else -1, pred_count)
         cv2.imencode('.jpg', out_img)[1].tofile(os.path.join(out_sub, name))
 
-    total = person_tracker.total_count()
-    return total, actual_count, {wid: len(win_seen) for wid, win_seen in window_seen.items()}
+    # 序列结束：离线合并分裂的 tracklet（治 ID 分裂），用合并后的计数
+    merge_map, merged_count = person_tracker.merge_tracklets()
+    if merge_map:
+        # 每窗人数也按合并映射去重
+        merged_win = {}
+        for wid, gidset in window_seen.items():
+            merged_win[wid] = {merge_map.get(g, g) for g in gidset}
+        window_seen = merged_win
+    return merged_count, actual_count, {wid: len(win_seen) for wid, win_seen in window_seen.items()}
 
 
 def main():
