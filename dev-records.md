@@ -311,3 +311,36 @@ _项目根目录变更记录。每次变更按 `YYYY_MM_DD_序号` 新增一个�
 精确 **6**、±1 有 5、≥+2 有 1（+1），与原始 v3 完全一致。**v3 确认为正式版本。**
 
 **教训：** 优化须"一次只改一个变量 + 12 序列回归"，先跑一个可复现基线（v3），再小步验证，避免叠加抑制导致净效果为负。
+
+---
+
+## 2026_08_30_001
+
+### 检测器评估体系建立（`evaluate_detector.py`）+ D 方案 v7 低分暂存实验
+
+**背景：** 用户想改检测器结构治"小目标漏检 + 头枕/反光误检"，但缺量化依据。建立评估体系在标注集上量化检测器真实漏检/误检率，再决定是否动结构。
+
+**检测器评估脚本：** `YOLO/target detection/evaluate_detector.py`
+- 在 val（4108 帧）/ test（4019 帧）标注集上，`predict(conf=0.001)` 拿全部原始预测，IoU≥0.5 判命中，逐类（car/head/window）算 TP/FP/FN、漏检率、误检率（A=FP/预测框，B=每帧FP数）、P/R/F1、mIoU。
+- 附带 head 阈值扫描（0.05→0.5）、GT 尺寸分桶、FP/FN 图册。
+- 产物：`YOLO/target detection/evaluation_output/{val,test}/`（`_report.txt`、`fp/`、`fn/` 图册）。
+- **踩坑修复**：`img_0037241.jpg` 一张图 cv2.imdecode 宽高读反（竖图），导致该帧坐标错位。改用 PIL 读图解决（PIL 按 JPEG SOF 真实尺寸读，正确横图）。
+
+**评估结论（test 4019 帧）：** head **漏检率 0.6%**（几乎不漏）、**误检率 62%**（每帧 4.6 个假框，低置信杂框+缺负样本）；car/window 漏检 <0.2%。→ **漏检不是主要矛盾（改结构无用），误检才是**（需负样本/跟踪层过滤，非结构问题）。
+
+**D 方案 v7（低分暂存）：** 在 `track_3class_window_bind_v4_pending.py` 的 `MotionCoherentTracker` 加"分级用检测"：
+1. 低分池（`lowconf_pool`+`lowconf_gids`）：head `conf<CONF_NEW_ID(0.25)` 且未匹配时，不建正式 ID，暂存特征等高分认领（防遮挡/模糊低分真头被拆 ID，同时滤低分噪声）。
+2. 高分认领暂存身份（升级为正式 gid）；`LOWCONF_AGE=5` 帧老化；`confirmed_ids` 排除低分暂存。
+
+**结果（当前标注，20 序列，A/B 对比）：**
+- A（CONF_NEW_ID=0.25）vs B（CONF_NEW_ID=0）逐序列完全一致 → 本批序列 head 全高分，低分暂存未触发（无害保护机制）。
+- **V7：精确 10/20、±1 有 19、≥±2 有 1、MAE 0.55**；同口径 V3 = 精确 9、MAE 0.60。**V7 略优于 V3，为当前最优。**
+- 剩余 +2：`20260715175447965`（pred 8 vs actual 6，高分 ID 分裂，V4 原有）。
+
+**注意：** 2026-08-30 复核更新了 `20260714213222518` 的 `total_registered.txt`（5→6），后续对比均以当前标注为准。
+
+**产物（未提交 git）：**
+- `YOLO/target detection/evaluate_detector.py` + `evaluation_output/`
+- `target tracking/track_3class_window_bind_v4_pending.py`（V7 低分暂存版）
+- `target tracking/_v3_annotated_benchmark.py`（V3 同口径基准副本）、`_v5_lowconf_backup.py`（V7 备份）
+- 批量输出：`tracking_output-标注人数版本/20260830_003`（V7）、`20260830_004`（V7 对照）、`YOLO/…/tracking_output/20260830_001`（V3 基准）
